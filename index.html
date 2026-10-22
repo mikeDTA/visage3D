@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Visage 3D articulé</title>
+<style>
+:root{--bg:#f4f6f7;--fg:#13222b;--card:#e5eaec;--ac:#0f766e;--on:#fff}
+@media(prefers-color-scheme:dark){:root{--bg:#10181c;--fg:#e8eff1;--card:#1b272d;--ac:#2dd4bf;--on:#062e2a}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,sans-serif;padding:14px;max-width:820px;margin-inline:auto}
+h1{font-size:1.5rem;margin:.2em 0}h2{font-size:1.05rem;margin:18px 0 6px}
+p.s{margin:0 0 12px;opacity:.75}
+#view{width:100%;height:320px;background:var(--card);border-radius:10px;touch-action:none}
+.ph{position:relative;margin:10px 0;line-height:0}.ph img{width:100%;border-radius:10px;cursor:crosshair}
+#mk{position:absolute;inset:0;pointer-events:none}
+#mk i{position:absolute;transform:translate(-50%,-50%);border:2px solid var(--ac);border-radius:50%;background:#0f766e55}
+.g{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px;margin:8px 0}
+label{display:flex;flex-direction:column;font-size:.85rem;gap:3px}
+input[type=range],select,input[type=file]{width:100%}
+button{background:var(--ac);color:var(--on);border:0;border-radius:8px;padding:12px 16px;font:inherit;font-weight:600;cursor:pointer}
+button:disabled{opacity:.5}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid var(--ac);outline-offset:2px}
+.r{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}
+#msg{min-height:1.4em;margin-top:10px}
+</style></head><body>
+<h1>Visage 3D articulé</h1>
+<p class="s">Photo → relief (IA) → pièces mobiles imprimées en une fois → STL / 3MF / G-code.</p>
+<input type="file" id="f" accept="image/*" aria-label="Photo du visage">
+<label style="flex-direction:row;gap:8px;margin-top:8px"><input id="ai" type="checkbox" checked> Profondeur par IA (Depth Anything V2, ~30 Mo au 1er usage)</label>
+<div id="view"></div>
+
+<h2>Pièces mobiles</h2>
+<p class="s">Touche la photo pour placer un disque rotatif (yeux, bouche…). Touche un disque pour le retirer.</p>
+<div class="ph"><img id="ph" alt="Photo : touche pour placer une pièce mobile"><div id="mk"></div></div>
+<div class="g">
+<label>Rayon du disque (mm)<input id="pr" type="range" min="4" max="25" value="9"></label>
+<label>Jeu de rotation (mm)<input id="gap" type="range" min="0.2" max="0.6" step="0.05" value="0.35"></label>
+</div>
+
+<h2>Relief</h2>
+<div class="g">
+<label>Largeur (mm)<input id="w" type="range" min="40" max="200" value="100"></label>
+<label>Relief (mm)<input id="d" type="range" min="2" max="40" value="14"></label>
+<label>Socle (mm)<input id="b" type="range" min="3" max="10" value="3.5" step="0.5"></label>
+<label>Lissage<input id="s" type="range" min="0" max="8" value="2"></label>
+<label>Détail (points)<input id="res" type="range" min="60" max="220" value="130"></label>
+<label style="flex-direction:row;gap:8px"><input id="inv" type="checkbox"> Inverser</label>
+</div>
+
+<h2>Impression</h2>
+<div class="g">
+<label>Imprimante<select id="pr2"><option value="k1">Creality K1</option><option value="hi">Creality Hi</option><option value="x1c">Bambu Lab X1 Carbon</option></select></label>
+<label>Filaments<select id="fil"><option value="1">Un seul filament</option><option value="2">2 filaments</option><option value="4">4 filaments (chargeur)</option></select></label>
+<label>Hauteur de couche<select id="lh"><option>0.12</option><option selected>0.2</option><option>0.28</option></select></label>
+<label>Remplissage (%)<input id="inf" type="range" min="0" max="100" value="15"></label>
+</div>
+<p class="s">G-code : choisis le dépôt GitHub (tranchage par GitHub Actions) ou un serveur PrusaSlicer.</p>
+<div class="g">
+<label>Dépôt GitHub (pseudo/depot)<input id="repo" placeholder="pseudo/visage3d" autocomplete="off"></label>
+<label>Jeton GitHub (Contents : écriture, ce dépôt seul)<input id="tok" type="password" autocomplete="off"></label>
+</div>
+<label>Ou serveur de tranchage (optionnel)<input id="api" type="url" placeholder="https://visage3d-tonnom.fly.dev"></label>
+<div class="r">
+<button id="bs" disabled>STL</button><button id="b3" disabled>3MF couleurs</button><button id="bg" disabled>G-code</button>
+</div>
+<div id="msg" role="status"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script type="module">
+const $=id=>document.getElementById(id), msg=t=>$('msg').textContent=t;
+const TF='https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.2';
+const MF='https://cdn.jsdelivr.net/npm/manifold-3d@3.0.0/manifold.js';
+const ZIP='https://cdn.jsdelivr.net/npm/jszip@3.10.1/+esm';
+const COLORS=['#d9d4c7','#e11d48','#2563eb','#16a34a'];
+const LIP=1.5, FH=1.0; // largeur de la collerette et épaisseur du disque captif
+const st={img:null,depth:null,parts:[],model:[],dim:{W:100,H:100},tok:0};
+
+/* ---------- aperçu 3D ---------- */
+const box=$('view'),R=new THREE.WebGLRenderer({antialias:true,alpha:true});
+R.setPixelRatio(devicePixelRatio);box.appendChild(R.domElement);
+const S=new THREE.Scene(),C=new THREE.PerspectiveCamera(40,1,1,2000),G=new THREE.Group();
+S.add(G,new THREE.HemisphereLight(0xffffff,0x445566,.8));
+const L=new THREE.DirectionalLight(0xffffff,.9);L.position.set(1,2,3);S.add(L);
+const O=new THREE.OrbitControls(C,R.domElement);
+const fit=()=>{const w=box.clientWidth,h=box.clientHeight;R.setSize(w,h);C.aspect=w/h;C.updateProjectionMatrix()};
+addEventListener('resize',fit);fit();
+(function loop(){requestAnimationFrame(loop);O.update();R.render(S,C)})();
+
+function show(model,first){
+  while(G.children.length){const m=G.children.pop();m.geometry.dispose()}
+  model.forEach(p=>{
+    let geo=new THREE.BufferGeometry();
+    geo.setAttribute('position',new THREE.BufferAttribute(p.v,3));geo.setIndex(new THREE.BufferAttribute(p.t,1));
+    geo=geo.toNonIndexed();geo.computeVertexNormals();
+    G.add(new THREE.Mesh(geo,new THREE.MeshStandardMaterial({color:p.color,roughness:.6})));
+  });
+  const {W,H,D}=st.dim;G.rotation.x=-Math.PI/2;G.position.set(-W/2,0,H/2);
+  if(first){C.position.set(0,W*.5,W*1.2);O.target.set(0,D/2,0)}
+}
+
+/* ---------- profondeur (IA open source) ---------- */
+let pipe;
+async function aiDepth(url){
+  msg('Chargement du modèle de profondeur (1re fois : quelques secondes)…');
+  const {pipeline}=await import(TF);
+  pipe??=await pipeline('depth-estimation','onnx-community/depth-anything-v2-small',{dtype:'q8'});
+  msg('Estimation de la profondeur…');
+  const {depth:d}=await pipe(url),ch=d.channels||1,id=new ImageData(d.width,d.height);
+  for(let k=0;k<d.width*d.height;k++){const v=d.data[k*ch];id.data.set([v,v,v,255],k*4)}
+  const c=document.createElement('canvas');c.width=d.width;c.height=d.height;
+  c.getContext('2d').putImageData(id,0,0);return c;
+}
+async function ensureDepth(){
+  if(!st.img)return;
+  if(!$('ai').checked){st.depth=null;return}
+  if(st.depth)return;
+  try{st.depth=await aiDepth(st.img.src);msg('')}
+  catch(e){st.depth=null;$('ai').checked=false;msg('IA indisponible, relief par luminosité ('+e.message+')')}
+}
+
+/* ---------- relief (maillage indexé étanche) ---------- */
+function blur(a,N,M,r){
+  if(!r)return;
+  for(let p=0;p<2;p++){
+    const t=new Float32Array(a.length);
+    for(let j=0;j<M;j++)for(let i=0;i<N;i++){let s=0,n=0;for(let k=-r;k<=r;k++){const q=i+k;if(q>=0&&q<N){s+=a[j*N+q];n++}}t[j*N+i]=s/n}
+    for(let j=0;j<M;j++)for(let i=0;i<N;i++){let s=0,n=0;for(let k=-r;k<=r;k++){const q=j+k;if(q>=0&&q<M){s+=t[q*N+i];n++}}a[j*N+i]=s/n}
+  }
+}
+function reliefMesh(){
+  const N=+$('res').value,W=+$('w').value,D=+$('d').value,g=+$('gap').value;
+  const B=Math.max(+$('b').value,FH+g+1.6);
+  const M=Math.max(2,Math.round(N*st.img.height/st.img.width)),H=W*st.img.height/st.img.width;
+  st.dim={W,H,B,D};
+  const c=document.createElement('canvas');c.width=N;c.height=M;
+  const x=c.getContext('2d');x.drawImage(st.depth||st.img,0,0,N,M);
+  const px=x.getImageData(0,0,N,M).data,gr=new Float32Array(N*M);
+  for(let k=0;k<N*M;k++)gr[k]=.299*px[k*4]+.587*px[k*4+1]+.114*px[k*4+2];
+  blur(gr,N,M,+$('s').value);
+  let mn=1e9,mx=-1e9;for(const v of gr){if(v<mn)mn=v;if(v>mx)mx=v}
+  const inv=$('inv').checked;
+  const Z=(i,j)=>{let v=(gr[(M-1-j)*N+i]-mn)/((mx-mn)||1);if(inv)v=1-v;
+    const u=i/(N-1)*2-1,t=j/(M-1)*2-1,f=Math.min(1,Math.max(0,1-(u*u+t*t))*2.5);return B+D*v*f};
+  const V=[],T=[],map=new Map();
+  const id=p=>{const k=p[0].toFixed(4)+','+p[1].toFixed(4)+','+p[2].toFixed(4);let n=map.get(k);if(n===undefined){n=V.length/3;V.push(p[0],p[1],p[2]);map.set(k,n)}return n};
+  const tri=(a,b,c)=>T.push(id(a),id(b),id(c));
+  const P=(i,j,z)=>[i*W/(N-1),j*H/(M-1),z];
+  for(let j=0;j<M-1;j++)for(let i=0;i<N-1;i++){
+    const a=P(i,j,Z(i,j)),b=P(i+1,j,Z(i+1,j)),c=P(i+1,j+1,Z(i+1,j+1)),d=P(i,j+1,Z(i,j+1));
+    tri(a,b,c);tri(a,c,d);
+    const a0=[a[0],a[1],0],b0=[b[0],b[1],0],c0=[c[0],c[1],0],d0=[d[0],d[1],0];
+    tri(a0,c0,b0);tri(a0,d0,c0);
+  }
+  const wall=(p,q,flip)=>{const b0=[p[0],p[1],0],b1=[q[0],q[1],0];
+    if(!flip){tri(b0,b1,q);tri(b0,q,p)}else{tri(b1,b0,p);tri(b1,p,q)}};
+  for(let i=0;i<N-1;i++){wall(P(i,0,Z(i,0)),P(i+1,0,Z(i+1,0)),false);wall(P(i,M-1,Z(i,M-1)),P(i+1,M-1,Z(i+1,M-1)),true)}
+  for(let j=0;j<M-1;j++){wall(P(0,j,Z(0,j)),P(0,j+1,Z(0,j+1)),true);wall(P(N-1,j,Z(N-1,j)),P(N-1,j+1,Z(N-1,j+1)),false)}
+  return {v:new Float32Array(V),t:new Uint32Array(T)};
+}
+
+/* ---------- pièces articulées (disque captif, imprimé en place) ---------- */
+let mfp;const mf=()=>mfp??=import(MF).then(async m=>{const w=await m.default();w.setup();return w});
+const repack=me=>{const n=me.numProp,s=me.vertProperties,v=new Float32Array(s.length/n*3);
+  for(let i=0;i<s.length/n;i++){v[i*3]=s[i*n];v[i*3+1]=s[i*n+1];v[i*3+2]=s[i*n+2]}return {v,t:new Uint32Array(me.triVerts)}};
+async function articulate(rel){
+  const {W,H,B,D}=st.dim,r=+$('pr').value,g=+$('gap').value,out=r+LIP+g;
+  const ps=st.parts.map(p=>({x:p.u*W,y:(1-p.v)*H}));
+  ps.forEach((p,i)=>{
+    if(p.x<out+1||p.y<out+1||p.x>W-out-1||p.y>H-out-1)throw new Error('un disque dépasse du bord : réduis le rayon');
+    ps.forEach((q,j)=>{if(j>i&&Math.hypot(p.x-q.x,p.y-q.y)<2*out+1)throw new Error('deux disques se touchent : écarte-les')});
+  });
+  const {Manifold,Mesh}=await mf();
+  const relief=new Manifold(new Mesh({numProp:3,vertProperties:rel.v,triVerts:rel.t}));
+  const top=B+D+2,cyl=(rad,z0,h,p)=>Manifold.cylinder(h,rad,rad,48).translate([p.x,p.y,z0]);
+  let plate=relief;const discs=[];
+  ps.forEach(p=>{
+    plate=plate.subtract(cyl(r+g,-1,top+1,p)).subtract(cyl(r+LIP+g,-1,FH+g+1,p)); // trou + poche de la collerette
+    discs.push(relief.intersect(cyl(r,-1,top+1,p)).add(cyl(r+LIP,0,FH,p)));       // disque + collerette captive
+  });
+  const n=Math.max(1,+$('fil').value-1);
+  return [{name:'Plaque',ext:1,...repack(plate.getMesh())},
+    ...discs.map((d,i)=>({name:'Disque '+(i+1),ext:+$('fil').value>1?2+i%n:1,...repack(d.getMesh())}))]
+    .map(p=>({...p,color:COLORS[(p.ext-1)%4]}));
+}
+
+/* ---------- construction / mise à jour ---------- */
+let timer;const refresh=()=>{clearTimeout(timer);timer=setTimeout(build,200)};
+async function build(){
+  if(!st.img)return;
+  const tok=++st.tok;await ensureDepth();if(tok!==st.tok)return;
+  const rel=reliefMesh();let model=[{name:'Plaque',ext:1,color:COLORS[0],...rel}];
+  if(st.parts.length){
+    msg('Création des pièces mobiles…');
+    try{model=await articulate(rel);msg('')}catch(e){msg('Articulation impossible : '+e.message)}
+  }
+  if(tok!==st.tok)return;
+  const first=!st.model.length;st.model=model;show(model,first);marks();
+  $('bs').disabled=$('b3').disabled=$('bg').disabled=false;
+}
+function marks(){
+  $('mk').innerHTML='';const {W}=st.dim;
+  st.parts.forEach(p=>{const d=document.createElement('i'),r=+$('pr').value/W*100;
+    d.style.cssText=`left:${p.u*100}%;top:${p.v*100}%;width:${2*r}%;aspect-ratio:1`;$('mk').appendChild(d)});
+}
+$('f').onchange=async e=>{
+  const f=e.target.files[0];if(!f)return;
+  const i=new Image();await new Promise(ok=>{i.onload=ok;i.src=URL.createObjectURL(f)});
+  Object.assign(st,{img:i,depth:null,parts:[],model:[]});$('ph').src=i.src;build();
+};
+$('ph').onclick=e=>{
+  const b=e.target.getBoundingClientRect(),u=(e.clientX-b.left)/b.width,v=(e.clientY-b.top)/b.height;
+  const {W,H}=st.dim,r=+$('pr').value,k=st.parts.findIndex(p=>Math.hypot((p.u-u)*W,(p.v-v)*H)<r);
+  k>=0?st.parts.splice(k,1):st.parts.push({u,v});marks();refresh();
+};
+['w','d','b','s','res','inv','pr','gap','fil'].forEach(id=>$(id).oninput=refresh);
+$('ai').onchange=refresh;
+
+/* ---------- exports ---------- */
+function stl(){
+  const tris=st.model.reduce((a,p)=>a+p.t.length/3,0),buf=new ArrayBuffer(84+tris*50),dv=new DataView(buf);
+  dv.setUint32(80,tris,true);let o=84;
+  for(const m of st.model)for(let k=0;k<m.t.length;k+=3){
+    const a=m.t[k]*3,b=m.t[k+1]*3,c=m.t[k+2]*3,v=m.v;
+    const ux=v[b]-v[a],uy=v[b+1]-v[a+1],uz=v[b+2]-v[a+2],wx=v[c]-v[a],wy=v[c+1]-v[a+1],wz=v[c+2]-v[a+2];
+    let nx=uy*wz-uz*wy,ny=uz*wx-ux*wz,nz=ux*wy-uy*wx;const l=Math.hypot(nx,ny,nz)||1;
+    [nx/l,ny/l,nz/l,v[a],v[a+1],v[a+2],v[b],v[b+1],v[b+2],v[c],v[c+1],v[c+2]].forEach((f,i)=>dv.setFloat32(o+i*4,f,true));o+=50;
+  }
+  return new Blob([buf],{type:'model/stl'});
+}
+async function threeMF(){
+  const JSZip=(await import(ZIP)).default,z=new JSZip(),f=n=>(+n).toFixed(4);
+  const mats=COLORS.map((c,i)=>`<base name="Filament ${i+1}" displaycolor="${c.toUpperCase()}FF"/>`).join('');
+  const objs=st.model.map((p,i)=>{
+    let vs='',ts='';
+    for(let k=0;k<p.v.length;k+=3)vs+=`<vertex x="${f(p.v[k])}" y="${f(p.v[k+1])}" z="${f(p.v[k+2])}"/>`;
+    for(let k=0;k<p.t.length;k+=3)ts+=`<triangle v1="${p.t[k]}" v2="${p.t[k+1]}" v3="${p.t[k+2]}"/>`;
+    return `<object id="${i+1}" type="model" pid="100" pindex="${p.ext-1}"><mesh><vertices>${vs}</vertices><triangles>${ts}</triangles></mesh></object>`;
+  }).join('');
+  const items=st.model.map((_,i)=>`<item objectid="${i+1}"/>`).join('');
+  z.file('[Content_Types].xml','<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/><Default Extension="config" ContentType="text/xml"/></Types>');
+  z.file('_rels/.rels','<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target="/3D/3dmodel.model" Id="rel0" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>');
+  z.file('3D/3dmodel.model',`<?xml version="1.0" encoding="UTF-8"?><model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"><resources><basematerials id="100">${mats}</basematerials>${objs}</resources><build>${items}</build></model>`);
+  const cfg=st.model.map((p,i)=>`<object id="${i+1}" instances_count="1"><metadata type="object" key="name" value="${p.name}"/><metadata type="object" key="extruder" value="${p.ext}"/><volume firstid="0" lastid="${p.t.length/3-1}"><metadata type="volume" key="name" value="${p.name}"/><metadata type="volume" key="extruder" value="${p.ext}"/></volume></object>`).join('');
+  z.file('Metadata/Slic3r_PE_model.config',`<?xml version="1.0" encoding="UTF-8"?><config>${cfg}</config>`);
+  return z.generateAsync({type:'blob',mimeType:'model/3mf',compression:'DEFLATE'});
+}
+const save=(b,n)=>{const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=n;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000)};
+$('bs').onclick=()=>save(stl(),'visage.stl');
+$('b3').onclick=async()=>save(await threeMF(),'visage.3mf');
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+async function viaGithub(repo,tok,n,q){
+  const id=Date.now().toString(36),ext=n>1?'3mf':'stl';
+  const gh=(p,o={})=>fetch('https://api.github.com/repos/'+repo+'/contents/'+p,{cache:'no-store',...o,headers:{Authorization:'Bearer '+tok,Accept:'application/vnd.github+json',...o.headers}});
+  const b64=async blob=>{const a=new Uint8Array(await blob.arrayBuffer());let s='';for(let i=0;i<a.length;i+=0x8000)s+=String.fromCharCode.apply(null,a.subarray(i,i+0x8000));return btoa(s)};
+  const put=async(p,content)=>{const r=await gh(p,{method:'PUT',body:JSON.stringify({message:'job '+id,content})});if(!r.ok)throw new Error('GitHub '+r.status+' : '+(await r.text()).slice(0,160))};
+  msg('Envoi du modèle à GitHub…');
+  await put(`jobs/${id}.${ext}`,await b64(n>1?await threeMF():stl()));
+  await put(`jobs/${id}.json`,btoa(JSON.stringify({id,ext,printer:q.get('printer'),layer:q.get('layer'),infill:q.get('infill'),extruders:n})));
+  const raw={Accept:'application/vnd.github.raw+json'};
+  for(let k=1;k<=60;k++){
+    await sleep(6000);msg(`Tranchage sur GitHub Actions… ${k*6} s`);
+    let r=await gh('output/'+id+'.gcode',{headers:raw});
+    if(r.ok){save(await r.blob(),'visage-'+q.get('printer')+'.gcode');return}
+    r=await gh('output/'+id+'.error.txt',{headers:raw});
+    if(r.ok)throw new Error(await r.text());
+  }
+  throw new Error('Délai dépassé : regarde l’onglet Actions du dépôt.');
+}
+$('bg').onclick=async()=>{
+  const b=$('bg'),repo=$('repo').value.trim(),tok=$('tok').value.trim(),base=$('api').value.trim().replace(/\/$/,'');
+  const gh=repo&&tok;
+  if(!gh&&!base){msg('Pour le G-code, renseigne le dépôt GitHub et le jeton, ou une URL de serveur. Sinon exporte le STL ou le 3MF.');return}
+  if(gh&&!/^[\w.-]+\/[\w.-]+$/.test(repo)){msg('Dépôt invalide : écris pseudo/depot');return}
+  b.disabled=true;
+  try{
+    const n=+$('fil').value,q=new URLSearchParams({printer:$('pr2').value,layer:$('lh').value,infill:$('inf').value,extruders:n});
+    if(gh)await viaGithub(repo,tok,n,q);
+    else{
+      msg('Tranchage en cours…');
+      const r=await fetch(base+'/api/slice?'+q,{method:'POST',body:n>1?await threeMF():stl()});
+      if(!r.ok)throw new Error(await r.text());
+      save(await r.blob(),'visage-'+$('pr2').value+'.gcode');
+    }
+    msg('G-code prêt.');
+  }catch(e){msg(e.message)}
+  b.disabled=false;
+};
+for(const k of ['api','repo']){try{$(k).value=localStorage.getItem(k)||''}catch(e){}$(k).oninput=()=>{try{localStorage.setItem(k,$(k).value)}catch(e){}}}
+try{$('tok').value=sessionStorage.getItem('tok')||''}catch(e){}
+$('tok').oninput=()=>{try{sessionStorage.setItem('tok',$('tok').value)}catch(e){}};
+</script></body></html>
